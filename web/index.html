@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jarvis</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #0b0d12; overflow: hidden;
+    font-family: system-ui, -apple-system, sans-serif; }
+  #scene { position: fixed; inset: 0; }
+  #hud { position: fixed; left: 0; right: 0; bottom: 0; padding: 14px;
+    display: flex; flex-direction: column; gap: 10px; align-items: center;
+    pointer-events: none; }
+  #caption { max-width: 640px; color: #cfd6e4; font-size: 14px;
+    line-height: 1.45; text-align: center; text-shadow: 0 1px 8px #000;
+    min-height: 20px; max-height: 110px; overflow: hidden; }
+  #caption .you { color: #77809a; font-style: italic; }
+  #bar { display: flex; gap: 8px; width: min(560px, 94vw);
+    pointer-events: auto; }
+  #msg { flex: 1; padding: 11px 15px; border-radius: 12px; border: 1px solid
+    #2a3140; background: #141926cc; color: #e8ecf4; font-size: 14px;
+    outline: none; backdrop-filter: blur(8px); }
+  #msg:focus { border-color: #4a5a78; }
+  button { padding: 11px 16px; border-radius: 12px; border: none;
+    background: #2d68ff; color: white; font-size: 14px; cursor: pointer; }
+  button:disabled { background: #2a3140; color: #77809a; cursor: default; }
+  #mic.on { background: #17a06b; }
+  #mic.hot { background: #d33e60; animation: pulse 1.2s infinite; }
+  @keyframes pulse { 50% { filter: brightness(1.35); } }
+  #topbar { display: none; position: fixed; top: 0; left: 0; right: 0;
+    height: 32px; align-items: center; justify-content: space-between;
+    padding: 0 6px 0 12px; -webkit-app-region: drag; z-index: 10;
+    background: linear-gradient(#131a28cc, transparent); }
+  body.widget #topbar { display: flex; }
+  body.widget #status { top: 36px; }
+  #apptitle { color: #5f7fb8; font-size: 11px; letter-spacing: 0.35em; }
+  .winbtns { -webkit-app-region: no-drag; display: flex; gap: 4px; }
+  .winbtns button { background: transparent; color: #77809a; padding: 2px 10px;
+    font-size: 15px; border-radius: 8px; }
+  .winbtns button:hover { background: #232b3b; color: #e8ecf4; }
+  #status { position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
+    color: #77809a; font-size: 12px; letter-spacing: 0.08em;
+    text-transform: uppercase; }
+  #status.listening { color: #4cd39a; }
+  #status.speaking { color: #7fa0ff; }
+  #agents { position: fixed; top: 40px; right: 12px; width: 240px;
+    display: flex; flex-direction: column; gap: 6px; pointer-events: auto; }
+  .agent { background: #141926dd; border: 1px solid #232b3b; border-radius: 10px;
+    padding: 8px 10px; font-size: 12px; color: #aab3c7;
+    backdrop-filter: blur(6px); }
+  .agent b { color: #e8ecf4; font-weight: 600; }
+  .agent .act { color: #77809a; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; display: block; margin-top: 2px; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    margin-right: 6px; }
+  .dot.running { background: #f5b942; animation: pulse 1.2s infinite; }
+  .dot.done { background: #4cd39a; }
+  .dot.error, .dot.starting { background: #d33e60; }
+  .dot.starting { background: #7fa0ff; }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="topbar">
+  <span id="apptitle">J A R V I S</span>
+  <span class="winbtns">
+    <button id="winmin" title="Minimize">–</button>
+    <button id="winhide" title="Hide (Ctrl+Shift+J to bring back)">✕</button>
+  </span>
+</div>
+<div id="status">loading…</div>
+<div id="agents"></div>
+<div id="hud">
+  <div id="caption"></div>
+  <div id="bar">
+    <input id="msg" placeholder="Talk or type…" autocomplete="off" disabled>
+    <button id="send" disabled>Send</button>
+    <button id="mic" title="Click: talk now (click again to send) · say “hey jarvis” anytime · double-click: mic off">🎤</button>
+  </div>
+</div>
+<script type="module" src="app.js"></script>
+</body>
+</html>

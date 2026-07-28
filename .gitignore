@@ -1,0 +1,8 @@
+.venv/
+build/
+data/
+browser-data/
+widget/node_modules/
+__pycache__/
+*.pyc
+nohup.out

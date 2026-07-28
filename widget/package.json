@@ -1,0 +1,13 @@
+{
+  "name": "jarvis-widget",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Electron desktop widget shell for the Jarvis local AI assistant",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^43.2.0"
+  }
+}
