@@ -1,4 +1,4 @@
-"""Jarvis's brain: LLM with orchestration + systems tools.
+"""Jarvis's brain: LLM voice companion over the user's Claude Code sessions.
 
 Backends:
   openrouter (default when a key exists) — OpenAI-compatible streaming with
@@ -6,9 +6,9 @@ Backends:
   ollama — local fallback (gemma4); also used automatically per-turn when
     OpenRouter is unreachable, so Jarvis survives offline.
 
-Jarvis never writes code himself. His tools spawn/inspect/message real Claude
-Code agents, and read/run what integrated systems (jarvis.md manifests)
-explicitly expose.
+Jarvis never writes code and never drives Claude directly. Turn completions
+arrive by themselves (Stop hook -> /claude-event); his tools only read
+transcripts and relay the user's words into a session through CloudCLI.
 """
 
 import asyncio
@@ -21,49 +21,31 @@ from server import config
 
 TOOLS = [
     {"type": "function", "function": {
-        "name": "list_projects",
-        "description": "List the user's project folders that agents can work in.",
+        "name": "sessions_overview",
+        "description": ("The user's recently active Claude Code sessions "
+                        "across all projects: id, project, how long ago, "
+                        "last message."),
         "parameters": {"type": "object", "properties": {}},
     }},
     {"type": "function", "function": {
-        "name": "spawn_agent",
-        "description": (
-            "Start a Claude Code agent working on a task inside a project "
-            "folder. Write the task as a complete, self-contained brief with "
-            "everything the agent needs. Returns the new agent's id."),
+        "name": "read_session",
+        "description": ("Read the last few messages of one session, e.g. to "
+                        "quote what it said or check what it needs."),
         "parameters": {"type": "object", "properties": {
-            "project": {"type": "string",
-                        "description": "Project folder name (fuzzy matched)"},
-            "task": {"type": "string",
-                     "description": "Detailed task brief for the agent"},
-            "full_auto": {"type": "boolean", "description":
-                          "Skip ALL permission checks (only when the user "
-                          "explicitly asked for full autonomy)"},
-            "max_budget_usd": {"type": "number", "description":
-                               "Optional cost cap for this agent run"},
-        }, "required": ["project", "task"]},
+            "session": {"type": "string", "description":
+                        "session id, id prefix, or project name"},
+            "count": {"type": "integer"}}, "required": ["session"]},
     }},
     {"type": "function", "function": {
-        "name": "agents_overview",
-        "description": ("Current status of all agents this session: running, "
-                        "done, failed, what each is doing right now."),
-        "parameters": {"type": "object", "properties": {}},
-    }},
-    {"type": "function", "function": {
-        "name": "agent_details",
-        "description": ("Detailed view of one agent: recent activity log and "
-                        "its final result if finished."),
+        "name": "send_to_session",
+        "description": ("Deliver the user's answer or instruction into a "
+                        "Claude Code session. The session treats it as its "
+                        "next prompt and its result is announced "
+                        "automatically when done."),
         "parameters": {"type": "object", "properties": {
-            "agent_id": {"type": "string"}}, "required": ["agent_id"]},
-    }},
-    {"type": "function", "function": {
-        "name": "send_to_agent",
-        "description": ("Send a follow-up instruction to a FINISHED agent, "
-                        "resuming its session with full context."),
-        "parameters": {"type": "object", "properties": {
-            "agent_id": {"type": "string"},
-            "message": {"type": "string"}},
-            "required": ["agent_id", "message"]},
+            "session": {"type": "string", "description":
+                        "session id, id prefix, or project name"},
+            "text": {"type": "string"}}, "required": ["session", "text"]},
     }},
     {"type": "function", "function": {
         "name": "remember",
@@ -72,194 +54,35 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "fact": {"type": "string"}}, "required": ["fact"]},
     }},
-    {"type": "function", "function": {
-        "name": "list_systems",
-        "description": ("List integrated systems (projects exposing a "
-                        "jarvis.md manifest): things like meal planning, "
-                        "home data, trackers."),
-        "parameters": {"type": "object", "properties": {}},
-    }},
-    {"type": "function", "function": {
-        "name": "system_info",
-        "description": ("A system's usage notes, exposed data files and "
-                        "runnable commands. Call before using a system."),
-        "parameters": {"type": "object", "properties": {
-            "system": {"type": "string"}}, "required": ["system"]},
-    }},
-    {"type": "function", "function": {
-        "name": "read_system_file",
-        "description": "Read one of the data files a system exposes.",
-        "parameters": {"type": "object", "properties": {
-            "system": {"type": "string"},
-            "path": {"type": "string"}}, "required": ["system", "path"]},
-    }},
-    {"type": "function", "function": {
-        "name": "run_system_command",
-        "description": ("Run a command DECLARED in a system's manifest. Some "
-                        "take a minute — tell the user before running one."),
-        "parameters": {"type": "object", "properties": {
-            "system": {"type": "string"},
-            "command": {"type": "string"}}, "required": ["system", "command"]},
-    }},
-    {"type": "function", "function": {
-        "name": "reminders",
-        "description": ("One-off reminders/timers that Jarvis announces out "
-                        "loud when due. Compute due_iso yourself from the "
-                        "current time (local, ISO like 2026-07-27T18:30)."),
-        "parameters": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["set", "list", "cancel"]},
-            "text": {"type": "string"},
-            "due_iso": {"type": "string"},
-            "id": {"type": "integer"}}, "required": ["action"]},
-    }},
-    {"type": "function", "function": {
-        "name": "todos",
-        "description": "The user's todo list: add items, list open, mark done.",
-        "parameters": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["add", "list", "done"]},
-            "text": {"type": "string",
-                     "description": "item text; for done: id or fuzzy text"}},
-            "required": ["action"]},
-    }},
-    {"type": "function", "function": {
-        "name": "notes",
-        "description": ("Quick capture notes ('note that...') and search "
-                        "them later. Different from remember: notes are "
-                        "content, facts are about the user."),
-        "parameters": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["add", "search"]},
-            "text": {"type": "string"}}, "required": ["action"]},
-    }},
-    {"type": "function", "function": {
-        "name": "get_weather",
-        "description": "Current weather + 3-day forecast for the user's city.",
-        "parameters": {"type": "object", "properties": {}},
-    }},
-    {"type": "function", "function": {
-        "name": "set_location",
-        "description": "Change the user's city for weather.",
-        "parameters": {"type": "object", "properties": {
-            "city": {"type": "string"}}, "required": ["city"]},
-    }},
-    {"type": "function", "function": {
-        "name": "morning_briefing",
-        "description": ("Everything for a spoken briefing: weather, "
-                        "reminders, todos, agents, active repos, tech news. "
-                        "Narrate the highlights in a few sentences."),
-        "parameters": {"type": "object", "properties": {}},
-    }},
-    {"type": "function", "function": {
-        "name": "repos_status",
-        "description": ("Which git repos have uncommitted changes or very "
-                        "recent commits."),
-        "parameters": {"type": "object", "properties": {}},
-    }},
-    {"type": "function", "function": {
-        "name": "system_health",
-        "description": "CPU, RAM, disk and GPU status of this machine.",
-        "parameters": {"type": "object", "properties": {}},
-    }},
-    {"type": "function", "function": {
-        "name": "tech_news",
-        "description": "Top Hacker News front-page stories right now.",
-        "parameters": {"type": "object", "properties": {
-            "count": {"type": "integer"}}},
-    }},
-    {"type": "function", "function": {
-        "name": "media_control",
-        "description": ("Control music/video playback and system volume: "
-                        "play, pause, playpause, next, previous, volume_up, "
-                        "volume_down, set_volume, mute."),
-        "parameters": {"type": "object", "properties": {
-            "action": {"type": "string"},
-            "level_pct": {"type": "integer"}}, "required": ["action"]},
-    }},
-    {"type": "function", "function": {
-        "name": "clipboard",
-        "description": "Read the clipboard, or copy dictated text onto it.",
-        "parameters": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["read", "write"]},
-            "text": {"type": "string"}}, "required": ["action"]},
-    }},
-    {"type": "function", "function": {
-        "name": "schedules",
-        "description": ("Recurring automations at HH:MM local: kind "
-                        "'briefing' (spoken briefing), 'say' (speak text), "
-                        "'agent' (spawn a Claude Code agent with project+task)."),
-        "parameters": {"type": "object", "properties": {
-            "action": {"type": "string",
-                       "enum": ["add", "list", "cancel"]},
-            "hhmm": {"type": "string"},
-            "kind": {"type": "string",
-                     "enum": ["briefing", "say", "agent"]},
-            "weekdays": {"type": "string", "description":
-                         "'daily' or e.g. 'mon,tue,wed,thu,fri'"},
-            "text": {"type": "string"},
-            "project": {"type": "string"},
-            "task": {"type": "string"},
-            "id": {"type": "integer"}}, "required": ["action"]},
-    }},
-    {"type": "function", "function": {
-        "name": "channels_overview",
-        "description": ("External agent sessions connected through Jarvis "
-                        "channels: who is active and who awaits a reply."),
-        "parameters": {"type": "object", "properties": {}},
-    }},
-    {"type": "function", "function": {
-        "name": "send_to_channel",
-        "description": ("Deliver the user's message to an external agent "
-                        "session waiting on a channel."),
-        "parameters": {"type": "object", "properties": {
-            "channel": {"type": "string"},
-            "text": {"type": "string"}},
-            "required": ["channel", "text"]},
-    }},
 ]
 
 SYSTEM_TEMPLATE = """You are Jarvis, the user's local voice assistant with a 3D face, \
-running on their machine. You are the orchestration layer over their Claude \
-Code agents and their personal systems: you spawn agents to do real work, \
-watch them, relay follow-ups, report back, and use integrated systems' data \
-to help in daily life.
+running on their machine. The user works in many Claude Code sessions at \
+once; you are their ears and voice over all of them. When any session \
+finishes a turn you are notified automatically and you announce it. The \
+user answers you by voice and you pass their words into the right session.
 
 Hard rules:
-- You never write code, diffs or shell commands yourself. Real work is ALWAYS \
-delegated to a Claude Code agent via spawn_agent. Your value is judgment: \
-picking the right project, writing an excellent task brief, monitoring, and \
-summarizing outcomes honestly.
-- When the user asks for work: choose the project, then spawn_agent with a \
-thorough brief (goal, constraints, how to verify). Confirm briefly. If the \
-work creates something Jarvis should later use, tell the agent to write a \
-jarvis.md manifest (name, description, data globs, commands) so it becomes \
-an integrated system.
-- When asked about progress, use agents_overview or agent_details — never \
-guess or invent status.
-- Integrated systems: when a request touches daily life (meals, tracking, \
-home data), check list_systems / system_info and use the exposed data and \
-commands. Follow each system's notes.
-- Walkthroughs (cooking, assembly, exercises): give exactly ONE short step, \
-then wait for the user to say they're done. Never recite everything at once.
-- Daily life: you also handle reminders/timers (announced aloud when due), \
-todos, notes, weather, spoken briefings, repo status, machine health, tech \
-news, media/volume control, the clipboard, and recurring schedules (daily \
-briefings or scheduled agent runs). For any reminder or schedule time, \
-compute the absolute local time yourself from the current date/time above. \
-When briefing, narrate only the interesting parts.
-- Use remember for durable facts worth keeping. full_auto only when the user \
-explicitly asked for no permission checks.
+- You never write code, diffs or shell commands yourself. The Claude Code \
+sessions do the real work; your value is relaying faithfully and \
+summarizing honestly.
+- Delivering words into a session is PHYSICALLY IMPOSSIBLE without \
+calling send_to_session — there is no other mechanism. When the user says \
+"tell them yes", "say go ahead", "ask it to also update the docs", you \
+MUST call send_to_session in that same turn, every time, even if a \
+similar exchange appears in the recent conversation. The most recently announced session is the target unless \
+they name another. If it is genuinely ambiguous, ask which session.
+- Relay content faithfully: rephrase for speech, never invent. If the user \
+asks what a session said, use read_session and quote the substance.
+- When asked what's going on, use sessions_overview — never guess status.
+- NEVER claim a message was sent unless you called send_to_session THIS \
+turn and it returned "delivered". If it returned an error or "UNCERTAIN", \
+tell the user its exact verdict instead. Saying "sent" without having done \
+it is the worst failure you can make.
+- Use remember for durable facts worth keeping.
 
-- Channels: OTHER agent sessions on this machine (interactive Claude Code \
-sessions in various repos) message the user through you. Their messages are \
-announced automatically. When the user answers one — "tell the padel session \
-to go ahead", or just "tell them yes" right after an announcement — deliver \
-it with send_to_channel. Check channels_overview when unsure who is waiting; \
-if more than one session awaits a reply and the target is unclear, ask which. \
-Relay the delivery status truthfully: "delivered" only if the tool said the \
-session was listening; if it said QUEUED, tell the user the session isn't \
-listening right now and will pick it up when it polls again.
-
-Channel state right now:
-{channels}
+Recently announced session turns (newest last):
+{sessions}
 
 Speaking style: your reply is spoken aloud by TTS. One to three short natural \
 sentences, plain text only — no markdown, no emoji, no lists, no code.
@@ -271,12 +94,6 @@ Long-term facts you know:
 
 Summary of earlier conversation:
 {summary}
-
-Live agent status right now:
-{agents}
-
-Integrated systems available:
-{systems}
 """
 
 SUMMARIZE_EVERY = 30
@@ -284,17 +101,15 @@ SUMMARIZE_EVERY = 30
 
 class Brain:
 
-  def __init__(self, memory, orchestrator, systems, daily, channels):
+  def __init__(self, memory, sessions):
     self.memory = memory
-    self.orch = orchestrator
-    self.systems = systems
-    self.daily = daily
-    self.channels = channels
+    self.sessions = sessions
     self.backend = config.BRAIN_BACKEND
     self.model = config.OPENROUTER_MODEL
     self.ollama_model = None
     self.client = httpx.AsyncClient(timeout=300)
     self._think_supported = True
+    self.tools_ran = []
 
   async def start(self):
     try:
@@ -320,16 +135,16 @@ class Brain:
 
   def _system(self) -> str:
     facts = self.memory.facts()
-    agents = self.orch.snapshot()
-    systems = self.systems.overview()
-    chans = self.channels.overview()
+    recent = [{"session_id": r["session_id"], "project": r["project"],
+               "minutes_ago": int((datetime.datetime.now().timestamp()
+                                   - r["at"]) / 60),
+               "said": (r.get("last_text") or "")[:200]}
+              for r in self.sessions.recent]
     return SYSTEM_TEMPLATE.format(
         now=datetime.datetime.now().strftime("%A %Y-%m-%d %H:%M"),
         facts="\n".join(f"- {f}" for f in facts) or "(none yet)",
         summary=self.memory.get_kv("summary", "(no earlier conversation)"),
-        agents=json.dumps(agents) if agents else "(no agents yet)",
-        systems=json.dumps(systems) if systems else "(none found)",
-        channels=json.dumps(chans) if chans else "(no external sessions)",
+        sessions=json.dumps(recent) if recent else "(none yet this run)",
     )
 
   def _messages(self, user_text: str) -> list[dict]:
@@ -349,7 +164,7 @@ class Brain:
   async def _or_stream(self, messages, tools):
     """Yields ('delta', text) then ('done', message) in OpenAI format."""
     payload = {"model": self.model, "messages": messages, "stream": True,
-               "temperature": 0.6}
+               "temperature": 0.3}
     if tools:
       payload["tools"] = tools
     content, tool_calls = "", {}
@@ -420,7 +235,7 @@ class Brain:
 
   async def _ollama_stream(self, messages, tools, model):
     payload = {"model": model, "messages": messages, "stream": True,
-               "options": {"temperature": 0.6}}
+               "options": {"temperature": 0.3}}
     if tools:
       payload["tools"] = tools
     if self._think_supported:
@@ -472,91 +287,20 @@ class Brain:
   # -- tools --
 
   async def _run_tool(self, name: str, args: dict) -> str:
+    self.tools_ran.append(name)
+    print(f"[brain] tool call: {name} {str(args)[:120]}", flush=True)
     try:
-      if name == "list_projects":
-        ps = self.orch.list_projects()
-        return json.dumps([{"name": p["name"],
-                            "claude_md": p["has_claude_md"]} for p in ps])
-      if name == "spawn_agent":
-        run = await self.orch.spawn(
-            args["project"], args["task"],
-            full_auto=bool(args.get("full_auto")),
-            max_budget_usd=args.get("max_budget_usd"))
-        if isinstance(run, str):
-          return run
-        return json.dumps({"agent_id": run.id, "project": run.project,
-                           "status": run.status})
-      if name == "agents_overview":
-        return json.dumps(self.orch.snapshot() or "no agents yet")
-      if name == "agent_details":
-        return json.dumps(self.orch.details(args["agent_id"]))
-      if name == "send_to_agent":
-        return await self.orch.send(args["agent_id"], args["message"])
+      if name == "sessions_overview":
+        return json.dumps(self.sessions.overview() or "no recent sessions")
+      if name == "read_session":
+        msgs = self.sessions.read_session(args["session"],
+                                          int(args.get("count", 6)))
+        return json.dumps(msgs or "session not found or empty")
+      if name == "send_to_session":
+        return await self.sessions.send(args["session"], args["text"])
       if name == "remember":
         self.memory.add_fact(args["fact"], source="jarvis")
         return "remembered"
-      if name == "list_systems":
-        return json.dumps(self.systems.overview() or "no systems integrated")
-      if name == "system_info":
-        return json.dumps(self.systems.describe(args["system"]))
-      if name == "read_system_file":
-        return self.systems.read_file(args["system"], args["path"])
-      if name == "run_system_command":
-        return await self.systems.run_command(args["system"], args["command"])
-      if name == "reminders":
-        act = args["action"]
-        if act == "set":
-          return self.daily.set_reminder(args["text"], args["due_iso"])
-        if act == "cancel":
-          return self.daily.cancel_reminder(args["id"])
-        return json.dumps(self.daily.list_reminders())
-      if name == "todos":
-        act = args["action"]
-        if act == "add":
-          return self.daily.add_todo(args["text"])
-        if act == "done":
-          return self.daily.complete_todo(args.get("text", ""))
-        return json.dumps(self.daily.list_todos())
-      if name == "notes":
-        if args["action"] == "add":
-          return self.daily.add_note(args["text"])
-        return json.dumps(self.daily.search_notes(args.get("text", "")))
-      if name == "get_weather":
-        return json.dumps(await self.daily.weather())
-      if name == "set_location":
-        return await self.daily.set_location(args["city"])
-      if name == "morning_briefing":
-        return json.dumps(await self.daily.briefing())
-      if name == "repos_status":
-        return json.dumps(self.daily.repos_status())
-      if name == "system_health":
-        return json.dumps(self.daily.system_health())
-      if name == "tech_news":
-        return json.dumps(await self.daily.tech_news(args.get("count", 5)))
-      if name == "media_control":
-        return self.daily.media(args["action"], args.get("level_pct"))
-      if name == "clipboard":
-        return self.daily.clipboard(args["action"], args.get("text", ""))
-      if name == "schedules":
-        act = args["action"]
-        if act == "add":
-          kind = args.get("kind", "briefing")
-          payload = {}
-          if kind == "say":
-            payload = {"text": args.get("text", "")}
-          elif kind == "agent":
-            payload = {"project": args.get("project", ""),
-                       "task": args.get("task", "")}
-          return self.daily.schedule_task(
-              args.get("hhmm", ""), kind, payload,
-              args.get("weekdays", "daily"))
-        if act == "cancel":
-          return self.daily.cancel_schedule(args["id"])
-        return json.dumps(self.daily.list_schedules())
-      if name == "channels_overview":
-        return json.dumps(self.channels.overview() or "no active channels")
-      if name == "send_to_channel":
-        return self.channels.reply(args["channel"], args["text"])
       return f"unknown tool {name}"
     except Exception as exc:  # noqa: BLE001 - tool errors go back to the model
       return f"tool error: {exc}"
@@ -565,6 +309,7 @@ class Brain:
 
   async def chat(self, user_text: str):
     """Async generator yielding ('text', delta) for the spoken reply."""
+    self.tools_ran = []
     self.memory.add_message("user", user_text)
     messages = self._messages(user_text)
     full = []
@@ -615,21 +360,24 @@ class Brain:
             parts.append(data)
     return "".join(parts).strip()
 
-  async def announce(self, run) -> str:
-    outcome = (run.result or "")[:600]
+  async def announce_turn(self, info: dict) -> str:
+    """One short spoken update for a finished session turn."""
+    said = (info.get("last_text") or "").strip()
+    asked = (info.get("last_user") or "").strip()
+    context = (f"The user had said:\n{asked[:400]}\n\n" if asked else "")
     prompt = (
-        f"The Claude Code agent working in project '{run.project}' on task "
-        f"\"{run.task[:200]}\" just "
-        f"{'finished' if run.status == 'done' else 'FAILED'}. "
-        f"Its report: {outcome}\n\n"
-        "Compose ONE short spoken sentence announcing this to the user, "
-        "plain text, natural, mention the project. Reply with only that "
-        "sentence.")
+        f"The Claude Code session in project '{info['project']}' just "
+        f"finished a turn. {context}"
+        f"Its message to the user:\n{said[:1500]}\n\n"
+        "Compose ONE or TWO short spoken sentences relaying this, plain "
+        "text, natural, mention the project. If it asks the user something, "
+        "make the question clear so they can answer by voice. Reply with "
+        "only those sentences.")
     text = await self._oneshot(prompt)
     announcement = text or (
-        f"The {run.project} agent just "
-        f"{'finished' if run.status == 'done' else 'failed'}.")
-    self.memory.add_message("assistant", announcement)
+        f"The {info['project']} session just finished a turn.")
+    self.memory.add_message(
+        "assistant", f"[{info['project']} session] {announcement}")
     return announcement
 
   async def _maybe_summarize(self):

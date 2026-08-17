@@ -1,5 +1,6 @@
 """Central configuration (env-overridable)."""
 
+import json
 import os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -15,8 +16,21 @@ MODEL_CANDIDATES = [
     ] if m
 ]
 
-PROJECTS_ROOT = os.path.expanduser(
-    os.environ.get("JARVIS_PROJECTS_ROOT", "~/Documents/GitHub"))
+def _cloudcli_conf():
+  path = os.path.join(ROOT, "data", "cloudcli.json")
+  try:
+    return json.load(open(path))
+  except (OSError, ValueError):
+    return {}
+
+
+_CLOUDCLI = _cloudcli_conf()
+CLOUDCLI_URL = os.environ.get(
+    "JARVIS_CLOUDCLI_URL", _CLOUDCLI.get("url", "http://127.0.0.1:3001"))
+CLOUDCLI_USER = os.environ.get(
+    "JARVIS_CLOUDCLI_USER", _CLOUDCLI.get("username", ""))
+CLOUDCLI_PASS = os.environ.get(
+    "JARVIS_CLOUDCLI_PASS", _CLOUDCLI.get("password", ""))
 
 
 def _read_key():
@@ -41,12 +55,6 @@ DB_PATH = os.path.join(ROOT, "data", "jarvis.db")
 AUDIO_DIR = os.path.join(ROOT, "build", "audio")
 WEB_DIR = os.path.join(ROOT, "web")
 
-CLAUDE_BIN = os.environ.get("JARVIS_CLAUDE_BIN", "claude")
-# Default permission mode for spawned agents. "auto" accepts edits and safe
-# in-cwd shell; full_auto per-spawn upgrades to --dangerously-skip-permissions
-# when the user explicitly asks for it.
-AGENT_PERMISSION_MODE = os.environ.get("JARVIS_AGENT_PERMISSIONS", "auto")
-MAX_CONCURRENT_AGENTS = int(os.environ.get("JARVIS_MAX_AGENTS", "6"))
 
 STT_MODEL = os.environ.get("JARVIS_STT_MODEL", "distil-large-v3")
 WAKE_WORD = os.environ.get("JARVIS_WAKE_WORD", "hey_jarvis")

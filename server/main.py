@@ -1,10 +1,11 @@
-"""Jarvis server v2: voice-first orchestration layer.
+"""Jarvis server v3: voice over the user's Claude Code sessions.
 
 Endpoints:
-  WS  /ws/ui      JSON protocol with the face UI / widget
-  WS  /ws/audio   binary 16k s16le PCM mic stream (wake word + STT)
-  POST /api/chat  REST fallback: full turn, non-streamed
-  GET  /          three.js face (web/), /audio/* synthesized clips
+  WS  /ws/ui        JSON protocol with the face UI / widget
+  WS  /ws/audio     binary 16k s16le PCM mic stream (wake word + STT)
+  POST /claude-event  Claude Code Stop hook: a session finished a turn
+  POST /api/chat    REST fallback: full turn, non-streamed
+  GET  /            three.js face (web/), /audio/* synthesized clips
 
 UI protocol (server -> client): state, caption_delta, chunk {text,audio,
 timeline}, chunks_done, user_text, wake, notify, agents.
@@ -17,24 +18,20 @@ import asyncio
 import contextlib
 import json
 import os
+import time
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-import time
-
 from server import config
 from server.brain import Brain
-from server.channels import Channels
-from server.daily import Daily
 from server.db import Memory
 from server.lipsync import LipSync
-from server.orchestrator import Orchestrator
 from server.pipeline import VoicePipeline
+from server.sessions import ClaudeSessions
 from server.speech import MicSession, SpeechEngine
-from server.systems import Systems
 from server.tts import TTS
 
 state = {}
@@ -52,10 +49,13 @@ async def broadcast(msg: dict):
     UI_SOCKETS.discard(ws)
 
 
-async def on_agent_event(run, kind):
-  await broadcast({"type": "agents", "agents": state["orch"].snapshot()})
-  if kind == "finished" and state.get("ready"):
-    asyncio.get_running_loop().create_task(announce_finish(run))
+def _session_cards():
+  """Announced turns as cards for the face UI's agent panel."""
+  now = time.time()
+  return [{"id": r["session_id"][:8], "project": r["project"],
+           "status": "done", "task": (r.get("last_text") or "")[:160],
+           "elapsed_s": 0, "finished_ago_s": int(now - r["at"])}
+          for r in state["sessions"].recent]
 
 
 async def speak_out(text: str, title: str = "Jarvis", body: str = None):
@@ -68,49 +68,20 @@ async def speak_out(text: str, title: str = "Jarvis", body: str = None):
     await broadcast({"type": "state", "state": "idle"})
 
 
-async def announce_finish(run):
+async def handle_turn_event(payload: dict):
+  info = await state["sessions"].record_turn(
+      payload.get("session_id", ""),
+      payload.get("cwd", ""),
+      payload.get("transcript_path", ""))
+  await broadcast({"type": "agents", "agents": _session_cards()})
+  if not info["last_text"]:
+    return  # nothing visible to announce (tool-only or empty turn)
   try:
-    text = await state["brain"].announce(run)
+    text = await state["brain"].announce_turn(info)
   except Exception:  # noqa: BLE001 - announcement is best-effort
-    text = f"Heads up: the {run.project} agent just finished."
-  await speak_out(text, title=f"Jarvis — {run.project}",
-                  body=run.result or text)
-
-
-async def background_loop():
-  last_health_check = 0.0
-  while True:
-    await asyncio.sleep(20)
-    if not state.get("ready"):
-      continue
-    daily = state["daily"]
-    try:
-      for r in daily.due_reminders():
-        await speak_out(f"Reminder: {r['text']}", title="Jarvis — reminder",
-                        body=r["text"])
-      for s in daily.due_schedules():
-        if s["kind"] == "say":
-          await speak_out(s["payload"].get("text", ""))
-        elif s["kind"] == "briefing":
-          data = await daily.briefing()
-          text = await state["brain"]._oneshot(
-              "Narrate this briefing to the user in four to six short spoken "
-              "sentences, plain text, highlights only:\n" +
-              json.dumps(data))
-          await speak_out(text or "Here is your briefing.",
-                          title="Jarvis — briefing")
-        elif s["kind"] == "agent":
-          p = s["payload"]
-          await state["orch"].spawn(p.get("project", ""), p.get("task", ""))
-      if time.time() - last_health_check > 600:
-        last_health_check = time.time()
-        for alert in daily.health_alerts():
-          key = "alerted_" + alert.split(":")[0].replace(" ", "_")[:30]
-          if time.time() - float(state["memory"].get_kv(key, "0")) > 7200:
-            state["memory"].set_kv(key, str(time.time()))
-            await speak_out(f"Heads up: {alert}.", title="Jarvis — system")
-    except Exception as exc:  # noqa: BLE001 - the loop must survive anything
-      print(f"[background] {exc}")
+    text = f"The {info['project']} session just finished a turn."
+  await speak_out(text, title=f"Jarvis — {info['project']}",
+                  body=info["last_text"])
 
 
 async def run_turn(text: str):
@@ -128,7 +99,6 @@ async def run_turn(text: str):
       await broadcast({"type": "error", "text": str(exc)[:300]})
     finally:
       await broadcast({"type": "state", "state": "idle"})
-      await broadcast({"type": "agents", "agents": state["orch"].snapshot()})
 
 
 @contextlib.asynccontextmanager
@@ -136,22 +106,16 @@ async def lifespan(_app):
   os.makedirs(config.AUDIO_DIR, exist_ok=True)
   state["turn_lock"] = asyncio.Lock()
   state["memory"] = Memory()
-  state["orch"] = Orchestrator(state["memory"], on_agent_event)
   state["tts"] = TTS()
   state["lipsync"] = LipSync()
   state["pipeline"] = VoicePipeline(state["tts"], state["lipsync"])
   state["speech"] = SpeechEngine()
-  state["systems"] = Systems()
-  state["daily"] = Daily(state["memory"], state["orch"])
-  state["channels"] = Channels()
-  state["brain"] = Brain(state["memory"], state["orch"], state["systems"],
-                         state["daily"], state["channels"])
+  state["sessions"] = ClaudeSessions()
+  state["brain"] = Brain(state["memory"], state["sessions"])
   model = await state["brain"].start()
   state["ready"] = True
-  loop_task = asyncio.get_running_loop().create_task(background_loop())
   print(f"[jarvis] ready — brain model: {model}")
   yield
-  loop_task.cancel()
   state.clear()
 
 
@@ -163,7 +127,7 @@ async def ws_ui(ws: WebSocket):
   await ws.accept()
   UI_SOCKETS.add(ws)
   await ws.send_text(json.dumps(
-      {"type": "agents", "agents": state["orch"].snapshot()}))
+      {"type": "agents", "agents": _session_cards()}))
   try:
     while True:
       raw = await ws.receive_text()
@@ -214,52 +178,21 @@ async def ws_audio(ws: WebSocket):
     pass
 
 
+@app.post("/claude-event")
+async def claude_event(request: Request):
+  """Claude Code Stop hook: fire-and-forget, never blocks the session."""
+  try:
+    payload = await request.json()
+  except Exception:  # noqa: BLE001
+    return JSONResponse({"error": "bad json"}, status_code=400)
+  if not state.get("ready") or not payload.get("session_id"):
+    return {"ok": False}
+  asyncio.get_running_loop().create_task(handle_turn_event(payload))
+  return {"ok": True}
+
+
 class ChatRequest(BaseModel):
   text: str
-
-
-class ChannelPost(BaseModel):
-  text: str
-  expect_reply: bool = False
-
-
-@app.post("/api/channel/{name}/send")
-async def channel_send(name: str, post: ChannelPost):
-  """External agents post messages the user hears through Jarvis."""
-  text = post.text.strip()
-  if not text:
-    return JSONResponse({"error": "empty message"}, status_code=400)
-  ch = state["channels"].post(name, text, post.expect_reply)
-  spoken = text
-  if len(spoken) > 400:
-    spoken = await state["brain"]._oneshot(
-        "Condense this agent report into two short spoken sentences, plain "
-        f"text:\n{text[:3000]}") or text[:400]
-  suffix = " They're waiting for your answer." if post.expect_reply else ""
-  state["memory"].add_message(
-      "assistant", f"[{ch.name} session] {text[:500]}")
-  asyncio.get_running_loop().create_task(speak_out(
-      f"Message from the {ch.name} session: {spoken}{suffix}",
-      title=f"Jarvis — {ch.name}", body=text))
-  return {"ok": True, "channel": ch.name}
-
-
-@app.get("/api/channel/{name}/wait")
-async def channel_wait(name: str, timeout: float = 300):
-  """Long-poll for the user's reply. The reply stays queued until ACKed."""
-  reply = await state["channels"].wait_for_reply(name, min(timeout, 570))
-  if reply is None:
-    return {"timeout": True}
-  return reply  # {"id": ..., "reply": ...}
-
-
-class AckPost(BaseModel):
-  id: int
-
-
-@app.post("/api/channel/{name}/ack")
-async def channel_ack(name: str, post: AckPost):
-  return {"acked": state["channels"].ack(name, post.id)}
 
 
 @app.post("/api/chat")
@@ -280,10 +213,9 @@ async def chat_rest(req: ChatRequest):
           "chunks": [c for c in chunks if c["type"] == "chunk"]}
 
 
-@app.get("/api/agents")
-async def agents_rest():
-  return {"agents": state["orch"].snapshot(),
-          "projects": [p["name"] for p in state["orch"].list_projects()]}
+@app.get("/api/health")
+async def health():
+  return {"ok": True, "ready": bool(state.get("ready"))}
 
 
 app.mount("/audio", StaticFiles(directory=config.AUDIO_DIR), name="audio")

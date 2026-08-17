@@ -9,7 +9,7 @@ LOG="$ROOT/build"
 status() {
   curl -s http://127.0.0.1:11434/api/tags >/dev/null 2>&1 \
     && echo "ollama:  running" || echo "ollama:  stopped"
-  curl -s http://127.0.0.1:8710/api/agents >/dev/null 2>&1 \
+  curl -s http://127.0.0.1:8710/api/health >/dev/null 2>&1 \
     && echo "server:  running (http://127.0.0.1:8710)" || echo "server:  stopped"
   pgrep -f "jarvis-widget|electron \." >/dev/null && echo "widget:  running" \
     || echo "widget:  stopped"
@@ -28,13 +28,13 @@ start_all() {
     (OLLAMA_KEEP_ALIVE=-1 "$OLLAMA" serve > "$LOG/ollama-serve.log" 2>&1 &)
     sleep 3
   fi
-  if ! curl -s http://127.0.0.1:8710/api/agents >/dev/null 2>&1; then
+  if ! curl -s http://127.0.0.1:8710/api/health >/dev/null 2>&1; then
     echo "starting jarvis server (models take ~60-90s to load)..."
     ( cd "$ROOT" && nohup .venv/bin/uvicorn server.main:app \
         --host 127.0.0.1 --port 8710 > "$LOG/server.log" 2>&1 < /dev/null & )
     for _ in $(seq 1 60); do
       sleep 3
-      curl -s http://127.0.0.1:8710/api/agents >/dev/null 2>&1 && break
+      curl -s http://127.0.0.1:8710/api/health >/dev/null 2>&1 && break
     done
   fi
   if ! pgrep -f "widget/node_modules/[e]lectron/dist/electron" >/dev/null; then
